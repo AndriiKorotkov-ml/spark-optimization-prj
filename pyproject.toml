@@ -1,0 +1,25 @@
+[project]
+name = "sales-pipeline"
+version = "0.3.0"
+description = "Scalable PySpark batch pipeline for e-commerce sales analytics"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = ["pyspark==4.2.0"]
+
+[project.scripts]
+sales-generate = "sales_pipeline.generate_data:main"
+sales-pipeline = "sales_pipeline.pipeline:main"
+sales-benchmark = "sales_pipeline.benchmark:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.13"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv]
+link-mode = "copy"

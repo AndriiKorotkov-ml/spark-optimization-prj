@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+data/
+output/
+spark-warehouse/
+metastore_db/
+*.log
+*.egg-info/
+.pytest_cache/
+
+.DS_Store
