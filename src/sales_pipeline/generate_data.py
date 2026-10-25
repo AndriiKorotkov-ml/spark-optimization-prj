@@ -48,27 +48,42 @@ def _pick(values: list[str], r: Column) -> Column:
 
 
 def generate_customers(spark: SparkSession, n: int, seed: int) -> DataFrame:
-    country = _pick(COUNTRIES, F.rand(seed))
-    messy = F.rand(seed + 1)
-    full_name = F.concat_ws(" ", _pick(FIRST, F.rand(seed + 2)), _pick(LAST, F.rand(seed + 3)))
-    signup = F.date_add(F.lit("2024-06-15").cast("date"), F.floor(F.rand(seed + 4) * 300).cast("int"))
+    country = F.col("clean_country")
+    messy = F.col("r_messy")
     return (
         spark.range(1, n + 1)
         .withColumns(
             {
+                "r_country": F.rand(seed),
+                "r_messy": F.rand(seed + 1),
+                "r_first": F.rand(seed + 2),
+                "r_last": F.rand(seed + 3),
+                "r_signup": F.rand(seed + 4),
+                "r_bad_date": F.rand(seed + 5),
+            }
+        )
+        .withColumns(
+            {
                 "customer_id": F.format_string("C%07d", "id"),
-                "full_name": full_name,
-                "country": F.when(messy < 0.33, F.lower(country))
-                .when(messy < 0.66, F.concat(F.lit(" "), country, F.lit(" ")))
-                .otherwise(country),
-                "signup_date": F.when(F.rand(seed + 5) < 0.02, F.lit("not-a-date")).otherwise(
-                    F.date_format(signup, "yyyy-MM-dd")
+                "clean_country": _pick(COUNTRIES, F.col("r_country")),
+                "full_name": F.concat_ws(" ", _pick(FIRST, F.col("r_first")), _pick(LAST, F.col("r_last"))),
+                "signup": F.date_add(
+                    F.lit("2024-06-15").cast("date"), F.floor(F.col("r_signup") * 300).cast("int")
                 ),
             }
         )
-        .withColumn(
-            "email",
-            F.lower(F.concat(F.regexp_replace("full_name", " ", "."), F.col("id"), F.lit("@example.com"))),
+        .withColumns(
+            {
+                "country": F.when(messy < 0.33, F.lower(country))
+                .when(messy < 0.66, F.concat(F.lit(" "), country, F.lit(" ")))
+                .otherwise(country),
+                "signup_date": F.when(F.col("r_bad_date") < 0.02, F.lit("not-a-date")).otherwise(
+                    F.date_format("signup", "yyyy-MM-dd")
+                ),
+                "email": F.lower(
+                    F.concat(F.regexp_replace("full_name", " ", "."), F.col("id"), F.lit("@example.com"))
+                ),
+            }
         )
         .select("customer_id", "full_name", "email", "country", "signup_date")
     )
