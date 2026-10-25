@@ -37,7 +37,7 @@ def test_clean_orders_rejects_bad_rows_and_dedups(spark):
             ("O7", "C1", "P1", "1", "2025-01-01 10:00:00", " COMPLETED "),
         ],
     )
-    valid, rejected = T.clean_orders(raw, products_df(spark))
+    valid, rejected = T.split_orders(T.label_orders(raw, products_df(spark)))
 
     assert sorted(r.order_id for r in valid.collect()) == ["O1", "O7"]
     reasons = {r.order_id: r.reject_reason for r in rejected.collect()}
@@ -142,11 +142,11 @@ def test_running_total(spark):
 
 
 def test_rfm_assigns_every_customer_a_segment(spark):
-    rfm = T.customer_rfm(T.order_facts(enriched_df(spark)), as_of="2025-03-01").collect()
-    assert {r.customer_id for r in rfm} == {"C1", "C2"}
-    assert all(r.segment for r in rfm)
-    c2 = next(r for r in rfm if r.customer_id == "C2")
-    assert c2.recency_days == 24
+    rfm = {r.customer_id: r for r in T.customer_rfm(T.order_facts(enriched_df(spark))).collect()}
+    assert set(rfm) == {"C1", "C2"}
+    assert all(r.segment for r in rfm.values())
+    assert rfm["C2"].recency_days == 1
+    assert rfm["C1"].recency_days == 5
 
 
 def test_return_rate_by_category(spark):
@@ -173,7 +173,8 @@ def test_rfm_scores_rank_bigger_spender_higher(spark):
     facts = spark.createDataFrame(
         rows, "customer_id string, country string, order_id string, status string, order_date date, order_total decimal(12,2)"
     )
-    scored = {r.customer_id: r for r in T.customer_rfm(facts, as_of="2025-02-01").collect()}
+    scored = {r.customer_id: r for r in T.customer_rfm(facts).collect()}
     assert scored["C7"].m_score > scored["C0"].m_score
     assert scored["C7"].r_score > scored["C0"].r_score
-    assert scored["C7"].recency_days == 24
+    assert scored["C7"].recency_days == 1
+    assert scored["C0"].recency_days == 8

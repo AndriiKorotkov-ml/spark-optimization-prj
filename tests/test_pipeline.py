@@ -11,14 +11,12 @@ from sales_pipeline.quality import DataQualityError
 @pytest.fixture(scope="module")
 def raw_dir(spark, tmp_path_factory):
     path = tmp_path_factory.mktemp("raw")
-    generate_data.generate(spark, str(path), n_customers=50, n_orders=400, seed=7, files=2)
+    generate_data.generate(spark, str(path), n_customers=50, n_orders=400, seed=7)
     return path
 
 
 def test_pipeline_end_to_end(spark, raw_dir, tmp_path):
-    cfg = PipelineConfig(
-        input_path=str(raw_dir), output_path=str(tmp_path), show_results=False, gold_parallelism=2
-    )
+    cfg = PipelineConfig(input_path=str(raw_dir), output_path=str(tmp_path), show_results=False)
     summary = run(spark, cfg)
 
     q = summary["quality"]

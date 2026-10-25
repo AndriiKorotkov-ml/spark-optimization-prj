@@ -58,10 +58,6 @@ def split_orders(labeled: DataFrame) -> tuple[DataFrame, DataFrame]:
     return valid, rejected
 
 
-def clean_orders(raw: DataFrame, products: DataFrame) -> tuple[DataFrame, DataFrame]:
-    return split_orders(label_orders(raw, products))
-
-
 def clean_customers(raw: DataFrame) -> DataFrame:
     latest_first = Window.partitionBy("customer_id").orderBy(F.desc_nulls_last("signup_date"))
     return (
@@ -183,7 +179,7 @@ def _quartile_score(col: str, cuts: list) -> Column:
     return F.when(c <= q1, 1).when(c <= q2, 2).when(c <= q3, 3).otherwise(4)
 
 
-def customer_rfm(orders: DataFrame, as_of: str | None = None, accuracy: int = 10_000) -> DataFrame:
+def customer_rfm(orders: DataFrame) -> DataFrame:
     base = (
         completed(orders)
         .groupBy("customer_id", "country")
@@ -197,12 +193,12 @@ def customer_rfm(orders: DataFrame, as_of: str | None = None, accuracy: int = 10
     probs = F.array(F.lit(0.25), F.lit(0.5), F.lit(0.75))
     stats = base.agg(
         F.max("last_order_date").alias("max_date"),
-        F.percentile_approx("last_order_day", probs, accuracy).alias("r"),
-        F.percentile_approx("frequency", probs, accuracy).alias("f"),
-        F.percentile_approx("monetary", probs, accuracy).alias("m"),
+        F.percentile_approx("last_order_day", probs).alias("r"),
+        F.percentile_approx("frequency", probs).alias("f"),
+        F.percentile_approx("monetary", probs).alias("m"),
     ).first()
 
-    ref = F.lit(as_of).cast("date") if as_of else F.date_add(F.lit(stats.max_date), 1)
+    ref = F.date_add(F.lit(stats.max_date), 1)
     scored = base.withColumns(
         {
             "recency_days": F.datediff(ref, "last_order_date"),

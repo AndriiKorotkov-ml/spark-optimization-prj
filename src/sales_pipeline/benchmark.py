@@ -1,8 +1,5 @@
 import argparse
-import json
 import time
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -12,7 +9,7 @@ from pyspark.sql import functions as F
 
 from . import transforms as T
 from .pipeline import COHORT_SQL, read_products, read_raw_orders
-from .spark import get_spark
+from .spark import DEFAULT_CONF, get_spark
 
 NAIVE_COHORT_SQL = """
 WITH first_order AS (
@@ -31,19 +28,6 @@ FROM activity GROUP BY cohort_month, month_number
 """
 
 
-@dataclass
-class Result:
-    experiment: str
-    baseline: str
-    optimized: str
-    baseline_s: float
-    optimized_s: float
-
-    @property
-    def speedup(self) -> float:
-        return self.baseline_s / self.optimized_s if self.optimized_s else float("inf")
-
-
 def noop(*dfs: DataFrame) -> Callable[[], None]:
     def action() -> None:
         for df in dfs:
@@ -52,26 +36,11 @@ def noop(*dfs: DataFrame) -> Callable[[], None]:
     return action
 
 
-@contextmanager
-def conf(spark: SparkSession, **settings: str):
-    keys = {k.replace("__", "."): v for k, v in settings.items()}
-    previous = {k: spark.conf.get(k, None) for k in keys}
-    for k, v in keys.items():
-        spark.conf.set(k, v)
-    try:
-        yield
-    finally:
-        for k, v in previous.items():
-            if v is None:
-                spark.conf.unset(k)
-            else:
-                spark.conf.set(k, v)
-
-
-def measure(spark: SparkSession, fn: Callable[[], None], repeats: int) -> float:
+def measure(spark: SparkSession, fn: Callable[[], None], repeats: int, clear_cache: bool = True) -> float:
     timings = []
     for _ in range(repeats):
-        spark.catalog.clearCache()
+        if clear_cache:
+            spark.catalog.clearCache()
         started = time.perf_counter()
         fn()
         timings.append(time.perf_counter() - started)
@@ -124,14 +93,18 @@ def gold_from(enriched: DataFrame, categories: list[str]) -> list[DataFrame]:
     ]
 
 
-def run(spark: SparkSession, raw_path: str, bronze_path: str, repeats: int) -> list[Result]:
-    results: list[Result] = []
+def add_result(results: list[dict], name: str, baseline: str, optimized: str, b: float, o: float) -> None:
+    results.append({"experiment": name, "baseline": baseline, "optimized": optimized, "baseline_s": b, "optimized_s": o})
+    print(f"{name:<22} {b:>7.2f}s -> {o:>7.2f}s  x{b / o:.1f}", flush=True)
+
+
+def run(spark: SparkSession, raw_path: str, bronze_path: str, repeats: int) -> list[dict]:
+    results: list[dict] = []
 
     def compare(name: str, baseline: str, base_fn, optimized: str, opt_fn) -> None:
         b = measure(spark, base_fn, repeats)
         o = measure(spark, opt_fn, repeats)
-        results.append(Result(name, baseline, optimized, b, o))
-        print(f"{name:<22} {b:>7.2f}s -> {o:>7.2f}s  x{b / o:.1f}", flush=True)
+        add_result(results, name, baseline, optimized, b, o)
 
     products = read_products(spark, raw_path)
     categories = sorted(r.category for r in products.select("category").distinct().collect())
@@ -152,15 +125,13 @@ def run(spark: SparkSession, raw_path: str, bronze_path: str, repeats: int) -> l
     def product_join() -> DataFrame:
         return bronze.join(products.drop("stock"), "product_id")
 
-    with conf(
-        spark,
-        spark__sql__autoBroadcastJoinThreshold="-1",
-        spark__sql__adaptive__autoBroadcastJoinThreshold="-1",
-    ):
-        smj = measure(spark, noop(product_join()), repeats)
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
+    spark.conf.set("spark.sql.adaptive.autoBroadcastJoinThreshold", "-1")
+    smj = measure(spark, noop(product_join()), repeats)
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", DEFAULT_CONF["spark.sql.autoBroadcastJoinThreshold"])
+    spark.conf.unset("spark.sql.adaptive.autoBroadcastJoinThreshold")
     bhj = measure(spark, noop(bronze.join(F.broadcast(products.drop("stock")), "product_id")), repeats)
-    results.append(Result("join: products", "sort-merge join", "broadcast hash join", smj, bhj))
-    print(f"{'join: products':<22} {smj:>7.2f}s -> {bhj:>7.2f}s  x{smj / bhj:.1f}", flush=True)
+    add_result(results, "join: products", "sort-merge join", "broadcast hash join", smj, bhj)
 
     def naive_dq() -> None:
         valid, rejected = naive_clean_orders(bronze, products)
@@ -183,7 +154,7 @@ def run(spark: SparkSession, raw_path: str, bronze_path: str, repeats: int) -> l
     )
 
     def enriched_df() -> DataFrame:
-        valid, _ = T.clean_orders(bronze, products)
+        valid, _ = T.split_orders(T.label_orders(bronze, products))
         return T.enrich_orders(valid, customers, products)
 
     def gold_no_cache() -> None:
@@ -209,14 +180,6 @@ def run(spark: SparkSession, raw_path: str, bronze_path: str, repeats: int) -> l
     enriched.count()
     facts.count()
     facts.createOrReplaceTempView("order_facts")
-
-    def no_clear(fn: Callable[[], None]) -> float:
-        timings = []
-        for _ in range(repeats):
-            started = time.perf_counter()
-            fn()
-            timings.append(time.perf_counter() - started)
-        return round(min(timings), 2)
 
     for name, baseline, base_fn, optimized, opt_fn in [
         (
@@ -249,17 +212,16 @@ def run(spark: SparkSession, raw_path: str, bronze_path: str, repeats: int) -> l
             noop(T.daily_revenue(facts)),
         ),
     ]:
-        b = no_clear(base_fn)
-        o = no_clear(opt_fn)
-        results.append(Result(name, baseline, optimized, b, o))
-        print(f"{name:<22} {b:>7.2f}s -> {o:>7.2f}s  x{b / o:.1f}", flush=True)
+        b = measure(spark, base_fn, repeats, clear_cache=False)
+        o = measure(spark, opt_fn, repeats, clear_cache=False)
+        add_result(results, name, baseline, optimized, b, o)
 
     facts.unpersist()
     enriched.unpersist()
     return results
 
 
-def to_markdown(results: list[Result], meta: dict) -> str:
+def to_markdown(results: list[dict], meta: dict) -> str:
     lines = [
         f"Dataset: {meta['raw_rows']:,} raw order lines, Spark {meta['spark']}, {meta['master']}, "
         f"best of {meta['repeats']} runs.",
@@ -269,8 +231,8 @@ def to_markdown(results: list[Result], meta: dict) -> str:
     ]
     for r in results:
         lines.append(
-            f"| {r.experiment} | {r.baseline} | {r.optimized} | {r.baseline_s:.2f} | "
-            f"{r.optimized_s:.2f} | x{r.speedup:.1f} |"
+            f"| {r['experiment']} | {r['baseline']} | {r['optimized']} | {r['baseline_s']:.2f} | "
+            f"{r['optimized_s']:.2f} | x{r['baseline_s'] / r['optimized_s']:.1f} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -300,9 +262,6 @@ def main(argv: list[str] | None = None) -> None:
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "results.json").write_text(
-        json.dumps({"meta": meta, "results": [asdict(r) | {"speedup": round(r.speedup, 2)} for r in results]}, indent=2)
-    )
     (out / "results.md").write_text(to_markdown(results, meta))
     print("\n" + to_markdown(results, meta))
 

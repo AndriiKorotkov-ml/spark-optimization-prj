@@ -2,7 +2,6 @@ import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from pathlib import Path
 
 from pyspark import StorageLevel
@@ -40,6 +39,10 @@ GROUP BY cohort_month, order_month
 ORDER BY cohort_month, month_number
 """
 
+TOP_N = 3
+MAX_RECORDS_PER_FILE = 1_000_000
+GOLD_PARALLELISM = 4
+
 SMALL_GOLD_TABLES = {
     "daily_revenue",
     "monthly_category_growth",
@@ -50,17 +53,8 @@ SMALL_GOLD_TABLES = {
 }
 
 
-class StageTimer:
-    def __init__(self) -> None:
-        self.durations: dict[str, float] = {}
-
-    @contextmanager
-    def stage(self, name: str):
-        log.info("stage %s: started", name)
-        started = time.perf_counter()
-        yield
-        self.durations[name] = round(time.perf_counter() - started, 2)
-        log.info("stage %s: done in %.2fs", name, self.durations[name])
+def elapsed(started: float) -> float:
+    return round(time.perf_counter() - started, 2)
 
 
 def read_raw_orders(spark: SparkSession, path: str) -> DataFrame:
@@ -127,97 +121,78 @@ def show(title: str, df: DataFrame, n: int = 10) -> None:
     df.show(n, truncate=False)
 
 
-def build_gold(
-    spark: SparkSession, enriched: DataFrame, facts: DataFrame, categories: list[str], cfg: PipelineConfig
-) -> dict[str, DataFrame]:
+def build_gold(spark: SparkSession, enriched: DataFrame, facts: DataFrame, categories: list[str]) -> dict[str, DataFrame]:
     facts.createOrReplaceTempView("order_facts")
     return {
         "daily_revenue": T.daily_revenue(facts),
         "monthly_category_growth": T.monthly_category_growth(enriched),
-        "top_products": T.top_products_per_category(enriched, cfg.top_n),
+        "top_products": T.top_products_per_category(enriched, TOP_N),
         "country_x_category": T.revenue_by_country_category(enriched, categories),
         "return_rate_by_category": T.return_rate_by_category(enriched),
-        "customer_rfm": T.customer_rfm(facts, cfg.as_of),
+        "customer_rfm": T.customer_rfm(facts),
         "customer_running_total": T.customer_running_total(facts),
         "cohort_retention": spark.sql(COHORT_SQL),
     }
 
 
-def print_results(gold: dict[str, DataFrame], report: quality.QualityReport, cfg: PipelineConfig) -> None:
+def print_results(gold: dict[str, DataFrame], report: quality.QualityReport) -> None:
     print(f"\n=== Rejected rows by reason ({report.duplicate_rows} duplicates removed) ===")
     for reason, rows in report.rejected_by_reason.items():
         print(f"  {reason:<24}{rows:>10}")
-    show("Daily revenue (last 7 days)", gold["daily_revenue"].orderBy(F.desc("order_date")), 7)
-    show(f"Top-{cfg.top_n} products per category", gold["top_products"], 5 * cfg.top_n)
-    show(
-        "Month-over-month growth (Electronics)",
-        gold["monthly_category_growth"].filter("category = 'Electronics'"),
-        12,
-    )
-    show("Revenue: country x category", gold["country_x_category"])
-    show("Return and cancel rate by category", gold["return_rate_by_category"])
-    show(
-        "RFM segments",
-        gold["customer_rfm"]
-        .groupBy("segment")
-        .agg(F.count("*").alias("customers"), F.round(F.avg("monetary"), 2).alias("avg_spend"))
-        .orderBy(F.desc("customers")),
-    )
-    show("Top customers by lifetime spend", gold["customer_rfm"].orderBy(F.desc("monetary")), 5)
-    first_cohort = gold["cohort_retention"].agg(F.min("cohort_month")).first()[0]
-    show(
-        f"Cohort retention ({first_cohort})",
-        gold["cohort_retention"].filter(F.col("cohort_month") == F.lit(first_cohort)),
-        12,
-    )
+    for name, df in gold.items():
+        show(name, df, 5)
 
 
 def run(spark: SparkSession, cfg: PipelineConfig) -> dict:
-    timer = StageTimer()
     out = cfg.output_path
+    durations: dict[str, float] = {}
 
-    with timer.stage("bronze"):
-        ingest_bronze(spark, cfg)
-        products = read_products(spark, cfg.input_path).cache()
-        categories = sorted(r.category for r in products.select("category").distinct().collect())
+    started = time.perf_counter()
+    ingest_bronze(spark, cfg)
+    products = read_products(spark, cfg.input_path).cache()
+    categories = sorted(r.category for r in products.select("category").distinct().collect())
+    durations["bronze"] = elapsed(started)
+    log.info("bronze done in %.2fs", durations["bronze"])
 
-    with timer.stage("silver"):
-        bronze_orders = spark.read.parquet(f"{out}/bronze/orders")
-        bronze_customers = spark.read.parquet(f"{out}/bronze/customers")
+    started = time.perf_counter()
+    bronze_orders = spark.read.parquet(f"{out}/bronze/orders")
+    bronze_customers = spark.read.parquet(f"{out}/bronze/customers")
 
-        labeled = T.label_orders(bronze_orders, products).persist(StorageLevel.MEMORY_AND_DISK_DESER)
-        valid, rejected = T.split_orders(labeled)
-        customers = T.clean_customers(bronze_customers)
-        enriched = T.enrich_orders(valid, customers, products).persist(StorageLevel.MEMORY_AND_DISK_DESER)
+    labeled = T.label_orders(bronze_orders, products).persist(StorageLevel.MEMORY_AND_DISK_DESER)
+    valid, rejected = T.split_orders(labeled)
+    customers = T.clean_customers(bronze_customers)
+    enriched = T.enrich_orders(valid, customers, products).persist(StorageLevel.MEMORY_AND_DISK_DESER)
 
-        report = quality.build_report(labeled, enriched.count())
-        log.info(
-            "quality: %d raw, %d valid, %d rejected (%.2f%%), %d duplicates",
-            report.raw_rows, report.valid_rows, report.rejected_rows,
-            report.reject_ratio * 100, report.duplicate_rows,
-        )
-        quality.enforce(report, cfg.max_reject_ratio)
+    report = quality.build_report(labeled, enriched.count())
+    log.info(
+        "quality: %d raw, %d valid, %d rejected (%.2f%%), %d duplicates",
+        report.raw_rows, report.valid_rows, report.rejected_rows,
+        report.reject_ratio * 100, report.duplicate_rows,
+    )
+    quality.enforce(report, cfg.max_reject_ratio)
 
-        write(
-            enriched.repartition("order_month").sortWithinPartitions("customer_id", "order_ts"),
-            f"{out}/silver/order_lines",
-            partition_by="order_month",
-            max_records_per_file=cfg.max_records_per_file,
-        )
-        write(rejected, f"{out}/quarantine/order_lines", files=1)
-        write(customers, f"{out}/silver/customers")
-        labeled.unpersist()
+    write(
+        enriched.repartition("order_month").sortWithinPartitions("customer_id", "order_ts"),
+        f"{out}/silver/order_lines",
+        partition_by="order_month",
+        max_records_per_file=MAX_RECORDS_PER_FILE,
+    )
+    write(rejected, f"{out}/quarantine/order_lines", files=1)
+    write(customers, f"{out}/silver/customers")
+    labeled.unpersist()
+    durations["silver"] = elapsed(started)
+    log.info("silver done in %.2fs", durations["silver"])
 
-    with timer.stage("gold"):
-        facts = T.order_facts(enriched).persist(StorageLevel.MEMORY_AND_DISK_DESER)
-        log.info("order facts: %d orders", facts.count())
-        gold = build_gold(spark, enriched, facts, categories, cfg)
-        write_gold(spark, gold, out, cfg.gold_parallelism)
+    started = time.perf_counter()
+    facts = T.order_facts(enriched).persist(StorageLevel.MEMORY_AND_DISK_DESER)
+    log.info("order facts: %d orders", facts.count())
+    gold = build_gold(spark, enriched, facts, categories)
+    write_gold(spark, gold, out, GOLD_PARALLELISM)
+    durations["gold"] = elapsed(started)
+    log.info("gold done in %.2fs", durations["gold"])
 
     if cfg.show_results:
-        print_results(gold, report, cfg)
-        print("\n=== Physical plan of the enrichment join ===")
-        T.enrich_orders(valid, customers, products).explain()
+        print_results(gold, report)
 
     facts.unpersist()
     enriched.unpersist()
@@ -225,15 +200,9 @@ def run(spark: SparkSession, cfg: PipelineConfig) -> dict:
 
     summary = {
         "quality": report.to_dict(),
-        "stage_seconds": timer.durations,
-        "total_seconds": round(sum(timer.durations.values()), 2),
+        "stage_seconds": durations,
+        "total_seconds": round(sum(durations.values()), 2),
         "gold_tables": sorted(gold),
-        "spark": {
-            "version": spark.version,
-            "master": spark.sparkContext.master,
-            "default_parallelism": spark.sparkContext.defaultParallelism,
-            "shuffle_partitions": spark.conf.get("spark.sql.shuffle.partitions"),
-        },
     }
     Path(out).mkdir(parents=True, exist_ok=True)
     Path(out, "_run_summary.json").write_text(json.dumps(summary, indent=2))
@@ -242,6 +211,7 @@ def run(spark: SparkSession, cfg: PipelineConfig) -> dict:
 
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("py4j").setLevel(logging.WARNING)
     cfg = PipelineConfig.from_args(argv)
     spark = get_spark()
     try:

@@ -30,7 +30,7 @@ RAW_CUSTOMERS = StructType(
 
 PRODUCTS = StructType(
     [
-        StructField("product_id", StringType(), nullable=False),
+        StructField("product_id", StringType()),
         StructField("product_name", StringType()),
         StructField("category", StringType()),
         StructField("price", DecimalType(10, 2)),
