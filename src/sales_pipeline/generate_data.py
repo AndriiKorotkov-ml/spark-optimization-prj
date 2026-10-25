@@ -137,14 +137,15 @@ def generate(
     n_customers: int = 200_000,
     n_orders: int = 1_000_000,
     seed: int = 42,
+    files: int | None = None,
 ) -> dict:
     out_path = Path(out)
     out_path.mkdir(parents=True, exist_ok=True)
-    files = max(1, n_orders // 250_000)
+    files = files or max(1, n_orders // 250_000)
 
     products = make_products(seed)
     with open(out_path / "products.json", "w") as f:
-        for p in products:
+        for p in products:  # noqa: FURB122
             f.write(json.dumps(p) + "\n")
 
     (
@@ -171,12 +172,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out", default="data/raw")
     parser.add_argument("--customers", type=int, default=200_000)
     parser.add_argument("--orders", type=int, default=1_000_000)
+    parser.add_argument("--files", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
 
     spark = get_spark("generate-data")
     try:
-        stats = generate(spark, args.out, args.customers, args.orders, args.seed)
+        stats = generate(spark, args.out, args.customers, args.orders, args.seed, args.files)
         print(f"generated {stats} -> {args.out}/")
     finally:
         spark.stop()
